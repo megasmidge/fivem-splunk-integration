@@ -1,13 +1,129 @@
+-- resources/splunk-logger/fxmanifest.lua
+fx_version 'cerulean'
+game 'gta5'
+lua54 'yes'
+
+author 'Your Name'
+description 'Splunk Integration for FiveM'
+version '1.0.0'
+
+server_scripts {
+    'config.lua',
+    'shared/events.lua',
+    'server/formatters.lua',
+    'server/http_client.lua',
+    'server/queue_manager.lua',
+    'server/main.lua'
+}
+
+client_scripts {
+    'shared/events.lua',
+    'client/main.lua'
+}
+
+exports {
+    'LogEvent',
+    'LogPlayerEvent',
+    'LogSystemEvent',
+    'GetQueueStats'
+}
+
+-- resources/splunk-logger/config.lua
 Config = {}
 
 -- Splunk HTTP Event Collector Configuration
 Config.Splunk = {
     hec_url = "https://your-splunk-instance.com:8088/services/collector",
     token = "your-hec-token-here",
-    index = "fivem_logs",
-    sourcetype = "fivem:json",
     timeout = 10000, -- 10 seconds
-    verify_ssl = true -- Set to false for self-signed certificates
+    verify_ssl = true, -- Set to false for self-signed certificates
+    
+    -- Default routing for events not specifically configured
+    default_index = "fivem_logs",
+    default_sourcetype = "fivem:json",
+    
+    -- Event routing configuration - maps event types to indexes and sourcetypes
+    routing = {
+        -- Player Events
+        [EventTypes.PLAYER_JOIN] = {
+            index = "fivem_players",
+            sourcetype = "fivem:player:lifecycle"
+        },
+        [EventTypes.PLAYER_LEAVE] = {
+            index = "fivem_players", 
+            sourcetype = "fivem:player:lifecycle"
+        },
+        [EventTypes.PLAYER_DEATH] = {
+            index = "fivem_players",
+            sourcetype = "fivem:player:combat"
+        },
+        [EventTypes.PLAYER_REVIVE] = {
+            index = "fivem_players",
+            sourcetype = "fivem:player:combat"
+        },
+        [EventTypes.PLAYER_POSITION] = {
+            index = "fivem_tracking",
+            sourcetype = "fivem:player:position"
+        },
+        [EventTypes.PLAYER_CHAT] = {
+            index = "fivem_social",
+            sourcetype = "fivem:player:chat"
+        },
+        
+        -- Economy Events
+        [EventTypes.MONEY_CHANGE] = {
+            index = "fivem_economy",
+            sourcetype = "fivem:economy:money"
+        },
+        [EventTypes.ITEM_PURCHASE] = {
+            index = "fivem_economy",
+            sourcetype = "fivem:economy:transaction"
+        },
+        [EventTypes.ITEM_TRANSFER] = {
+            index = "fivem_economy",
+            sourcetype = "fivem:economy:transfer"
+        },
+        [EventTypes.JOB_PAYMENT] = {
+            index = "fivem_economy",
+            sourcetype = "fivem:economy:payroll"
+        },
+        
+        -- Security Events
+        [EventTypes.ANTI_CHEAT_TRIGGER] = {
+            index = "fivem_security",
+            sourcetype = "fivem:security:anticheat"
+        },
+        [EventTypes.ADMIN_ACTION] = {
+            index = "fivem_security",
+            sourcetype = "fivem:security:admin"
+        },
+        [EventTypes.CHAT_VIOLATION] = {
+            index = "fivem_security",
+            sourcetype = "fivem:security:violation"
+        },
+        
+        -- System Events
+        [EventTypes.RESOURCE_START] = {
+            index = "fivem_system",
+            sourcetype = "fivem:system:resource"
+        },
+        [EventTypes.RESOURCE_STOP] = {
+            index = "fivem_system",
+            sourcetype = "fivem:system:resource"
+        },
+        [EventTypes.SERVER_PERFORMANCE] = {
+            index = "fivem_system",
+            sourcetype = "fivem:system:performance"
+        },
+        [EventTypes.DATABASE_QUERY] = {
+            index = "fivem_system",
+            sourcetype = "fivem:system:database"
+        },
+        [EventTypes.ERROR_EVENT] = {
+            index = "fivem_system",
+            sourcetype = "fivem:system:error"
+        }
+    }
 }
 
 -- Event Batching Configuration
@@ -32,3 +148,553 @@ Config.Server = {
     id = GetConvar('sv_hostname', 'unknown-server'),
     environment = GetConvar('sv_environment', 'production') -- development/production
 }
+
+-- resources/splunk-logger/shared/events.lua
+-- Event type definitions and schemas
+EventTypes = {
+    -- Player Events
+    PLAYER_JOIN = 'player_join',
+    PLAYER_LEAVE = 'player_leave',
+    PLAYER_DEATH = 'player_death',
+    PLAYER_REVIVE = 'player_revive',
+    PLAYER_POSITION = 'player_position',
+    PLAYER_CHAT = 'player_chat',
+    
+    -- Economy Events
+    MONEY_CHANGE = 'money_change',
+    ITEM_PURCHASE = 'item_purchase',
+    ITEM_TRANSFER = 'item_transfer',
+    JOB_PAYMENT = 'job_payment',
+    
+    -- Security Events
+    ANTI_CHEAT_TRIGGER = 'anti_cheat_trigger',
+    ADMIN_ACTION = 'admin_action',
+    CHAT_VIOLATION = 'chat_violation',
+    
+    -- System Events
+    RESOURCE_START = 'resource_start',
+    RESOURCE_STOP = 'resource_stop',
+    SERVER_PERFORMANCE = 'server_performance',
+    DATABASE_QUERY = 'database_query',
+    ERROR_EVENT = 'error_event'
+}
+
+-- resources/splunk-logger/server/formatters.lua
+local Formatters = {}
+
+-- Create base event structure with routing information
+function Formatters.CreateBaseEvent(eventType, playerData, eventData)
+    local baseEvent = {
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        server_id = Config.Server.id,
+        environment = Config.Server.environment,
+        event_type = eventType,
+        source_resource = GetInvokingResource() or 'splunk-logger',
+        version = '1.0'
+    }
+    
+    if playerData then
+        baseEvent.player_data = playerData
+    end
+    
+    if eventData then
+        baseEvent.event_data = eventData
+    end
+    
+    return baseEvent
+end
+
+-- Get routing information for an event type
+function Formatters.GetEventRouting(eventType)
+    local routing = Config.Splunk.routing[eventType]
+    if routing then
+        return routing.index, routing.sourcetype
+    else
+        -- Fallback to defaults for unknown event types
+        return Config.Splunk.default_index, Config.Splunk.default_sourcetype
+    end
+end
+
+-- Create Splunk HEC event with proper routing
+function Formatters.CreateHECEvent(eventType, playerData, eventData)
+    local baseEvent = Formatters.CreateBaseEvent(eventType, playerData, eventData)
+    local index, sourcetype = Formatters.GetEventRouting(eventType)
+    
+    -- Wrap in HEC format
+    local hecEvent = {
+        time = os.time(),
+        host = Config.Server.id,
+        index = index,
+        sourcetype = sourcetype,
+        event = baseEvent
+    }
+    
+    return hecEvent
+end
+
+-- Format player data consistently
+function Formatters.FormatPlayerData(source)
+    if not source then return nil end
+    
+    local playerData = {
+        server_id = source,
+        steam_id = nil,
+        discord_id = nil,
+        player_name = GetPlayerName(source)
+    }
+    
+    -- Extract Steam ID
+    for i = 0, GetNumPlayerIdentifiers(source) - 1 do
+        local id = GetPlayerIdentifier(source, i)
+        if string.find(id, 'steam:') then
+            playerData.steam_id = id
+        elseif string.find(id, 'discord:') then
+            playerData.discord_id = id
+        end
+    end
+    
+    return playerData
+end
+
+-- Sanitize sensitive data
+function Formatters.SanitizeEventData(eventData)
+    if not eventData then return nil end
+    
+    local sanitized = {}
+    for k, v in pairs(eventData) do
+        -- Remove sensitive fields
+        if k ~= 'password' and k ~= 'token' and k ~= 'api_key' then
+            sanitized[k] = v
+        end
+    end
+    
+    return sanitized
+end
+
+-- Export functions
+_G.Formatters = Formatters
+
+-- resources/splunk-logger/server/http_client.lua
+local HttpClient = {}
+local pendingRequests = {}
+
+-- Send HTTP request to Splunk HEC
+function HttpClient.SendToSplunk(events)
+    if not events or #events == 0 then
+        return false
+    end
+    
+    local payload = ""
+    for _, event in ipairs(events) do
+        payload = payload .. json.encode(event) .. "\n"
+    end
+    
+    local headers = {
+        ['Content-Type'] = 'application/json',
+        ['Authorization'] = 'Splunk ' .. Config.Splunk.token
+    }
+    
+    local requestData = {
+        url = Config.Splunk.hec_url,
+        method = 'POST',
+        data = payload,
+        headers = headers,
+        timeout = Config.Splunk.timeout
+    }
+    
+    -- Track request for monitoring
+    local requestId = #pendingRequests + 1
+    pendingRequests[requestId] = {
+        timestamp = GetGameTimer(),
+        event_count = #events,
+        status = 'pending'
+    }
+    
+    PerformHttpRequest(requestData.url, function(statusCode, responseBody, responseHeaders)
+        HttpClient.HandleResponse(requestId, statusCode, responseBody, events)
+    end, requestData.method, requestData.data, requestData.headers)
+    
+    return true
+end
+
+-- Handle HTTP response
+function HttpClient.HandleResponse(requestId, statusCode, responseBody, originalEvents)
+    local request = pendingRequests[requestId]
+    if not request then return end
+    
+    local success = statusCode >= 200 and statusCode < 300
+    request.status = success and 'success' or 'failed'
+    request.status_code = statusCode
+    request.response_time = GetGameTimer() - request.timestamp
+    
+    if success then
+        if Config.Events.enable_debug_logging then
+            print(string.format('[SplunkLogger] Successfully sent %d events to Splunk', request.event_count))
+        end
+        
+        -- Log success metric
+        QueueManager.LogSystemEvent(EventTypes.DATABASE_QUERY, {
+            operation = 'splunk_http_success',
+            event_count = request.event_count,
+            response_time = request.response_time,
+            status_code = statusCode
+        })
+    else
+        print(string.format('[SplunkLogger] Failed to send events to Splunk. Status: %d, Response: %s', 
+              statusCode, responseBody))
+        
+        -- Log failure and potentially retry
+        QueueManager.LogSystemEvent(EventTypes.ERROR_EVENT, {
+            operation = 'splunk_http_failed',
+            status_code = statusCode,
+            response_body = responseBody,
+            event_count = request.event_count
+        })
+        
+        -- Retry logic handled by queue manager
+        QueueManager.HandleFailedBatch(originalEvents)
+    end
+    
+    -- Clean up request tracking
+    pendingRequests[requestId] = nil
+end
+
+-- Get HTTP client statistics
+function HttpClient.GetStats()
+    local stats = {
+        pending_requests = 0,
+        total_requests = 0
+    }
+    
+    for _ in pairs(pendingRequests) do
+        stats.pending_requests = stats.pending_requests + 1
+    end
+    
+    return stats
+end
+
+-- Export functions
+_G.HttpClient = HttpClient
+
+-- resources/splunk-logger/server/queue_manager.lua
+local QueueManager = {}
+local eventQueue = {}
+local retryQueue = {}
+local stats = {
+    events_queued = 0,
+    events_sent = 0,
+    events_failed = 0,
+    batches_sent = 0,
+    last_flush = 0,
+    events_by_index = {},  -- Track events per index
+    events_by_sourcetype = {}  -- Track events per sourcetype
+}
+
+-- Initialize queue manager
+function QueueManager.Init()
+    -- Start flush timer
+    CreateThread(function()
+        while true do
+            Wait(Config.Batching.flush_interval)
+            QueueManager.FlushQueue()
+        end
+    end)
+    
+    -- Start retry timer
+    CreateThread(function()
+        while true do
+            Wait(Config.Batching.retry_delay)
+            QueueManager.ProcessRetryQueue()
+        end
+    end)
+    
+    print('[SplunkLogger] Queue manager initialized')
+end
+
+-- Add event to queue
+function QueueManager.QueueEvent(event)
+    if #eventQueue >= Config.Batching.max_queue_size then
+        print('[SplunkLogger] Queue is full, dropping event')
+        stats.events_failed = stats.events_failed + 1
+        return false
+    end
+    
+    table.insert(eventQueue, event)
+    stats.events_queued = stats.events_queued + 1
+    
+    -- Track routing statistics
+    if event.index then
+        stats.events_by_index[event.index] = (stats.events_by_index[event.index] or 0) + 1
+    end
+    if event.sourcetype then
+        stats.events_by_sourcetype[event.sourcetype] = (stats.events_by_sourcetype[event.sourcetype] or 0) + 1
+    end
+    
+    -- Force flush if batch size reached
+    if #eventQueue >= Config.Batching.max_batch_size then
+        QueueManager.FlushQueue()
+    end
+    
+    return true
+end
+
+-- Flush queue to Splunk
+function QueueManager.FlushQueue()
+    if #eventQueue == 0 then return end
+    
+    local batch = {}
+    local batchSize = math.min(#eventQueue, Config.Batching.max_batch_size)
+    
+    for i = 1, batchSize do
+        table.insert(batch, eventQueue[i])
+    end
+    
+    -- Remove processed events from queue
+    for i = batchSize, 1, -1 do
+        table.remove(eventQueue, i)
+    end
+    
+    if HttpClient.SendToSplunk(batch) then
+        stats.events_sent = stats.events_sent + #batch
+        stats.batches_sent = stats.batches_sent + 1
+        stats.last_flush = GetGameTimer()
+        
+        if Config.Events.enable_debug_logging then
+            print(string.format('[SplunkLogger] Flushed batch of %d events', #batch))
+        end
+    else
+        -- Re-queue events on failure
+        for _, event in ipairs(batch) do
+            table.insert(eventQueue, 1, event)
+        end
+    end
+end
+
+-- Handle failed batch for retry
+function QueueManager.HandleFailedBatch(events)
+    for _, event in ipairs(events) do
+        -- Add retry count and timestamp
+        event._retry_count = (event._retry_count or 0) + 1
+        event._retry_timestamp = GetGameTimer()
+        
+        if event._retry_count <= Config.Batching.retry_attempts then
+            table.insert(retryQueue, event)
+        else
+            print('[SplunkLogger] Event exceeded retry limit, dropping')
+            stats.events_failed = stats.events_failed + 1
+        end
+    end
+end
+
+-- Process retry queue
+function QueueManager.ProcessRetryQueue()
+    if #retryQueue == 0 then return end
+    
+    local now = GetGameTimer()
+    local eventsToRetry = {}
+    
+    for i = #retryQueue, 1, -1 do
+        local event = retryQueue[i]
+        if now - event._retry_timestamp >= Config.Batching.retry_delay then
+            table.insert(eventsToRetry, event)
+            table.remove(retryQueue, i)
+        end
+    end
+    
+    -- Re-queue events for retry
+    for _, event in ipairs(eventsToRetry) do
+        -- Clean up retry metadata
+        event._retry_timestamp = nil
+        QueueManager.QueueEvent(event)
+    end
+end
+
+-- Main logging function
+function QueueManager.LogEvent(eventType, playerData, eventData)
+    local event = Formatters.CreateHECEvent(eventType, playerData, eventData)
+    return QueueManager.QueueEvent(event)
+end
+
+-- Convenience function for player events
+function QueueManager.LogPlayerEvent(eventType, source, eventData)
+    local playerData = Formatters.FormatPlayerData(source)
+    local sanitizedData = Formatters.SanitizeEventData(eventData)
+    return QueueManager.LogEvent(eventType, playerData, sanitizedData)
+end
+
+-- Convenience function for system events
+function QueueManager.LogSystemEvent(eventType, eventData)
+    local sanitizedData = Formatters.SanitizeEventData(eventData)
+    return QueueManager.LogEvent(eventType, nil, sanitizedData)
+end
+
+-- Get queue statistics
+function QueueManager.GetStats()
+    return {
+        queue_size = #eventQueue,
+        retry_queue_size = #retryQueue,
+        events_queued = stats.events_queued,
+        events_sent = stats.events_sent,
+        events_failed = stats.events_failed,
+        batches_sent = stats.batches_sent,
+        last_flush = stats.last_flush,
+        uptime = GetGameTimer(),
+        events_by_index = stats.events_by_index,
+        events_by_sourcetype = stats.events_by_sourcetype
+    }
+end
+
+-- Export functions
+_G.QueueManager = QueueManager
+
+-- resources/splunk-logger/server/main.lua
+-- Main server-side initialization and exports
+
+-- Initialize components
+CreateThread(function()
+    QueueManager.Init()
+    print('[SplunkLogger] Splunk Logger initialized successfully')
+    
+    -- Log server startup
+    QueueManager.LogSystemEvent(EventTypes.RESOURCE_START, {
+        resource_name = 'splunk-logger',
+        server_id = Config.Server.id,
+        environment = Config.Server.environment
+    })
+end)
+
+-- Export functions for other resources
+exports('LogEvent', function(eventType, playerData, eventData)
+    return QueueManager.LogEvent(eventType, playerData, eventData)
+end)
+
+exports('LogPlayerEvent', function(eventType, source, eventData)
+    return QueueManager.LogPlayerEvent(eventType, source, eventData)
+end)
+
+exports('LogSystemEvent', function(eventType, eventData)
+    return QueueManager.LogSystemEvent(eventType, eventData)
+end)
+
+exports('GetQueueStats', function()
+    return QueueManager.GetStats()
+end)
+
+-- Built-in player event handlers
+RegisterNetEvent('playerConnecting', function(name, setKickReason, deferrals)
+    local source = source
+    Wait(1000) -- Wait for player to fully connect
+    
+    QueueManager.LogPlayerEvent(EventTypes.PLAYER_JOIN, source, {
+        connect_time = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        player_name = name,
+        server_slot = source
+    })
+end)
+
+RegisterNetEvent('playerDropped', function(reason)
+    local source = source
+    QueueManager.LogPlayerEvent(EventTypes.PLAYER_LEAVE, source, {
+        disconnect_time = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        reason = reason
+    })
+end)
+
+-- Chat logging
+RegisterNetEvent('chatMessage', function(source, name, message)
+    if Config.Events.enable_chat_logging then
+        QueueManager.LogPlayerEvent(EventTypes.PLAYER_CHAT, source, {
+            message = message,
+            message_length = string.len(message)
+        })
+    end
+end)
+
+-- Performance monitoring
+if Config.Events.enable_performance_monitoring then
+    CreateThread(function()
+        while true do
+            Wait(30000) -- Every 30 seconds
+            
+            local playerCount = GetNumPlayerIndices()
+            local uptime = GetGameTimer()
+            
+            QueueManager.LogSystemEvent(EventTypes.SERVER_PERFORMANCE, {
+                player_count = playerCount,
+                uptime_ms = uptime,
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
+            })
+        end
+    end)
+end
+
+-- Resource cleanup
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName == GetCurrentResourceName() then
+        QueueManager.LogSystemEvent(EventTypes.RESOURCE_STOP, {
+            resource_name = resourceName,
+            final_stats = QueueManager.GetStats()
+        })
+        
+        -- Flush remaining events
+        QueueManager.FlushQueue()
+    end
+end)
+
+-- Admin command to check logger status
+RegisterCommand('splunk-status', function(source, args, rawCommand)
+    if source ~= 0 then -- Only console can run this
+        return
+    end
+    
+    local queueStats = QueueManager.GetStats()
+    local httpStats = HttpClient.GetStats()
+    
+    print('=== Splunk Logger Status ===')
+    print(string.format('Queue Size: %d', queueStats.queue_size))
+    print(string.format('Retry Queue: %d', queueStats.retry_queue_size))
+    print(string.format('Events Sent: %d', queueStats.events_sent))
+    print(string.format('Events Failed: %d', queueStats.events_failed))
+    print(string.format('Batches Sent: %d', queueStats.batches_sent))
+    print(string.format('Pending Requests: %d', httpStats.pending_requests))
+    print(string.format('Last Flush: %d ms ago', GetGameTimer() - queueStats.last_flush))
+    
+    print('\n=== Event Distribution by Index ===')
+    for index, count in pairs(queueStats.events_by_index) do
+        print(string.format('%s: %d events', index, count))
+    end
+    
+    print('\n=== Event Distribution by Sourcetype ===')
+    for sourcetype, count in pairs(queueStats.events_by_sourcetype) do
+        print(string.format('%s: %d events', sourcetype, count))
+    end
+end, true)
+
+-- resources/splunk-logger/client/main.lua
+-- Client-side event collection
+
+-- Track player position periodically
+if Config.Events.player_position_interval > 0 then
+    CreateThread(function()
+        while true do
+            Wait(Config.Events.player_position_interval)
+            
+            local playerPed = PlayerPedId()
+            local coords = GetEntityCoords(playerPed)
+            local heading = GetEntityHeading(playerPed)
+            
+            TriggerServerEvent('splunk-logger:playerPosition', {
+                x = coords.x,
+                y = coords.y,
+                z = coords.z,
+                heading = heading
+            })
+        end
+    end)
+end
+
+-- Register server event for position updates
+RegisterNetEvent('splunk-logger:playerPosition', function(positionData)
+    exports['splunk-logger']:LogPlayerEvent(EventTypes.PLAYER_POSITION, source, positionData)
+end)
+
