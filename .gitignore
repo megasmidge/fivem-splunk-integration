@@ -137,3 +137,30 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# FiveM Splunk Integration
+resources/splunk-logger/config.lua
+*.token
+secrets/
+cache/
+server.cfg
+txData/
+
+# FiveM server files
+citizen/
+alpine/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
